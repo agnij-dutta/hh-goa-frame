@@ -10,6 +10,9 @@ type Format = "pfp" | "card";
 const CAPTION =
   "Just got my HH Goa 2026 builder pass 🌴☀️ See you on the beach. #FrameInGoa";
 
+const SITE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL || "https://hh-goa-frame.vercel.app";
+
 export default function Generator() {
   const [img, setImg] = useState<LoadedImage | null>(null);
   const [format, setFormat] = useState<Format>("pfp");
@@ -20,6 +23,8 @@ export default function Generator() {
   const [sharing, setSharing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [canNativeShare, setCanNativeShare] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+  const [info, setInfo] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   // The canvas is deliberately kept OUT of the DOM: some Chrome states
@@ -39,6 +44,10 @@ export default function Generator() {
     } catch {
       setCanNativeShare(false);
     }
+    setIsMobile(
+      /Android|iPhone|iPod/i.test(navigator.userAgent) ||
+        navigator.maxTouchPoints > 1
+    );
   }, []);
 
   // redraw whenever inputs change
@@ -100,11 +109,58 @@ export default function Generator() {
     }
   }, [toBlob, format]);
 
+  /**
+   * Share with the actual image attached wherever the platform allows it.
+   * - Mobile: native share sheet with the PNG file — picking X composes a
+   *   tweet with the picture attached and the caption prefilled.
+   * - Desktop: X's web intent can't accept a file, so the PNG is copied to
+   *   the clipboard (one paste attaches it) and the intent opens prefilled
+   *   with the caption + a share link whose card preview IS the graphic, so
+   *   the post shows the image even if the user never pastes.
+   */
   const shareToX = useCallback(async () => {
     setError(null);
+    setInfo(null);
     setSharing(true);
-    // open a window synchronously so popup blockers allow it
+
+    // Mobile path: real file attach via the native share sheet
+    if (canNativeShare && isMobile) {
+      try {
+        const blob = await toBlob();
+        const file = new File([blob], "hh-goa-2026.png", { type: "image/png" });
+        await navigator.share({ files: [file], text: `${CAPTION}\n${SITE_URL}` });
+        setInfo("Shared! If you picked X, your graphic is attached — just hit Post.");
+        setSharing(false);
+        return;
+      } catch (e) {
+        if ((e as Error).name === "AbortError") {
+          // user closed the sheet on purpose
+          setSharing(false);
+          return;
+        }
+        // sheet unavailable — fall through to the web intent path
+      }
+    }
+
+    // Desktop path. Start the clipboard write while the document is still
+    // focused (a popup steals focus, and Chrome queues clipboard writes for
+    // unfocused documents — awaiting it here would hang the whole flow),
+    // then open the popup synchronously w.r.t. the click to survive blockers.
+    let clipboardPromise: Promise<boolean>;
+    try {
+      // promise-form ClipboardItem keeps Safari happy inside a user gesture
+      clipboardPromise = navigator.clipboard
+        .write([new ClipboardItem({ "image/png": toBlob() })])
+        .then(() => true)
+        .catch(() => false);
+    } catch {
+      clipboardPromise = Promise.resolve(false);
+    }
     const popup = window.open("about:blank", "_blank");
+    const copied = await Promise.race([
+      clipboardPromise,
+      new Promise<boolean>((r) => setTimeout(() => r(false), 1500)),
+    ]);
     try {
       const blob = await toBlob();
       const res = await fetch("/api/share", {
@@ -114,36 +170,31 @@ export default function Generator() {
       });
       if (!res.ok) throw new Error(await res.text());
       const { shareUrl } = (await res.json()) as { shareUrl: string };
-      const intent = `https://twitter.com/intent/tweet?text=${encodeURIComponent(
+      const intent = `https://x.com/intent/post?text=${encodeURIComponent(
         CAPTION
       )}&url=${encodeURIComponent(shareUrl)}`;
       if (popup) popup.location.href = intent;
       else window.location.href = intent;
-    } catch {
-      popup?.close();
-      // fallback: still open a pre-filled tweet, user attaches the downloaded image
-      setError(
-        "Couldn't create a share link — downloaded the image instead. Attach it to your tweet!"
+      setInfo(
+        copied
+          ? "Your graphic is on the clipboard — press ⌘V / Ctrl+V in the tweet to attach the image."
+          : "Tweet opened — the link preview shows your graphic. For a direct attach, download the PNG and add it."
       );
-      await download();
-      window.open(
-        `https://twitter.com/intent/tweet?text=${encodeURIComponent(CAPTION)}`,
-        "_blank"
+    } catch {
+      // last resort: bare prefilled tweet in the popup we already own
+      const bare = `https://x.com/intent/post?text=${encodeURIComponent(CAPTION)}`;
+      if (popup) popup.location.href = bare;
+      else window.open(bare, "_blank");
+      if (!copied) await download();
+      setInfo(
+        copied
+          ? "Tweet opened — press ⌘V / Ctrl+V to attach your graphic (it's on the clipboard)."
+          : "Tweet opened + your PNG downloaded — attach it before posting."
       );
     } finally {
       setSharing(false);
     }
-  }, [toBlob, format, download]);
-
-  const nativeShare = useCallback(async () => {
-    try {
-      const blob = await toBlob();
-      const file = new File([blob], "hh-goa-2026.png", { type: "image/png" });
-      await navigator.share({ files: [file], text: CAPTION });
-    } catch {
-      /* user cancelled — ignore */
-    }
-  }, [toBlob]);
+  }, [toBlob, format, download, canNativeShare, isMobile]);
 
   const pick = () => fileRef.current?.click();
 
@@ -270,17 +321,19 @@ export default function Generator() {
               >
                 {sharing ? "PREPPING TWEET…" : "𝕏 SHARE ON X"}
               </button>
-              {canNativeShare && (
-                <button
-                  onClick={nativeShare}
-                  className="w-full rounded-xl border border-white/20 px-5 py-3 font-mono text-xs tracking-wider text-cream/90 transition-colors hover:border-teal"
-                >
-                  ⇪ share image directly (attaches the PNG)
-                </button>
-              )}
+              <p className="text-center font-mono text-[11px] leading-relaxed text-cream/50">
+                {canNativeShare && isMobile
+                  ? "opens your share sheet with the image attached — pick X and post"
+                  : "copies the image + opens a prefilled tweet — paste to attach"}
+              </p>
             </div>
           )}
 
+          {info && (
+            <p className="rounded-lg border border-teal/40 bg-teal/10 px-3 py-2 font-mono text-xs text-cream">
+              {info}
+            </p>
+          )}
           {error && (
             <p className="rounded-lg border border-pink/40 bg-pink/10 px-3 py-2 font-mono text-xs text-cream">
               {error}
